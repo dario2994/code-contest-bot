@@ -25,15 +25,15 @@ class CompleteState:
         self.current_problem = None
         self.scores = {}  # (contestant, problem): score
 
-    def is_admin(self, name):
+    def is_admin(self, user_id):
         for admin in self.admins:
-            if admin.name == name:
+            if admin.user_id == user_id:
                 return True
         return False
 
-    def is_contestant(self, name):
+    def is_contestant(self, user_id):
         for contestant in self.contestants:
-            if contestant.name == name:
+            if contestant.user_id == user_id:
                 return True
         return False
 
@@ -47,7 +47,8 @@ class CodeContestError(Exception):
 
 
 class User:
-    def __init__(self, name, chat_id):
+    def __init__(self, name, chat_id, user_id):
+        self.user_id = user_id
         self.chat_id = chat_id
         self.name = name
 
@@ -105,13 +106,26 @@ COMMAND_DESCRIPTIONS = {
 }
 
 
-def i_am_contestant(bot, update):
-    name = update.effective_user.last_name
+def extract_user_info(update):
+    if update.effective_user.last_name:
+        name = update.effective_user.last_name
+    elif update.effective_user.username:
+        name = update.effective_user.username
+    elif update.effective_user.first_name:
+        name = update.effective_user.first_name
+    else:
+        raise CodeContestError('It is not possible to identify your user with a name. Please fill in your profile one of the fields: username, last name, first name.')
     chat_id = update.message.chat_id
+    user_id = update.effective_user.id
+    return (name, chat_id, user_id)
+
+
+def i_am_contestant(bot, update):
+    name, chat_id, user_id = extract_user_info(update)
     try:
-        if data.is_contestant(name):
+        if data.is_contestant(user_id):
             raise CodeContestError('You are already registered as contestant.')
-        data.contestants.append(User(name, chat_id))
+        data.contestants.append(User(name, chat_id, user_id))
         save_data_on_disk()
 
         bot.send_message(chat_id=chat_id, text='You are now registered as contestant.')
@@ -120,16 +134,15 @@ def i_am_contestant(bot, update):
 
 
 def i_am_admin(bot, update, args):
-    name = update.effective_user.last_name
-    chat_id = update.message.chat_id
+    name, chat_id, user_id = extract_user_info(update)
     try:
         if len(args) != 1:
             raise CodeContestError('Usage: {0} .'.format(COMMAND_DESCRIPTIONS['Register as admin'].usage))
         if args[0] != admin_password:
             raise CodeContestError('Wrong password')
-        if data.is_admin(name):
+        if data.is_admin(user_id):
             raise CodeContestError('You are already registered as admin.')
-        data.admins.append(User(name, chat_id))
+        data.admins.append(User(name, chat_id, user_id))
         save_data_on_disk()
 
         bot.send_message(chat_id=chat_id, text='You are now registered as admin.')
@@ -138,10 +151,9 @@ def i_am_admin(bot, update, args):
 
 
 def create_problem(bot, update, args):
-    name = update.effective_user.last_name
-    chat_id = update.message.chat_id
+    name, chat_id, user_id = extract_user_info(update)
     try:
-        if not data.is_admin(name):
+        if not data.is_admin(user_id):
             raise CodeContestError('Only admins can create a problem.')
         if len(args) != 4:
             raise CodeContestError('Usage: {0} .'.format(COMMAND_DESCRIPTIONS['Create problem'].usage))
@@ -176,20 +188,19 @@ Partial score until: {5} ({6} minutes).
 
 
 def add_submission(bot, update):
-    name = update.effective_user.last_name
-    chat_id = update.message.chat_id
+    name, chat_id, user_id = extract_user_info(update)
     try:
         if data.current_problem is None:
             raise CodeContestError('There is no problem active now.')
-        if not data.is_contestant(name):
+        if not data.is_contestant(user_id):
             raise CodeContestError('Only a contestant can register his submissions.')
         overwrite_previous_submission = False
-        if (name, data.current_problem.name) in data.scores \
+        if (user_id, data.current_problem.name) in data.scores \
                 and not overwrite_previous_submission:
             raise CodeContestError('You have already registered a submission for the current problem.')
 
         score = data.current_problem.give_score()
-        data.scores[(name, data.current_problem.name)] = score
+        data.scores[(user_id, data.current_problem.name)] = score
         save_data_on_disk()
 
         for admin in data.admins:
@@ -201,49 +212,57 @@ def add_submission(bot, update):
 
 
 def delete_submission(bot, update, args):
-    name = update.effective_user.last_name
-    chat_id = update.message.chat_id
+    name, chat_id, user_id = extract_user_info(update)
     try:
-        if not data.is_admin(name):
+        if not data.is_admin(user_id):
             raise CodeContestError('Only admins can delete a submission.')
         if len(args) != 2:
             raise CodeContestError('Usage: {0} .'.format(COMMAND_DESCRIPTIONS['Delete submission'].usage))
+        contestant_id = None
         contestant_name = args[0]
         problem_name = args[1]
-        if (contestant_name, problem_name) not in data.scores:
+        for contestant in data.contestants:
+            if contestant.name == contestant_name:
+                contestant_id = contestant.user_id
+                break
+        if not contestant_id:
+            raise CodeContestError('The contestant \'{0}\' does not exist.'.format(contestant_name))
+        if (contestant_id, problem_name) not in data.scores:
             raise CodeContestError('The submission ({0}, {1}) does not exist.'.format(contestant_name, problem_name))
-        del data.scores[(contestant_name, problem_name)]
+        del data.scores[(contestant_id, problem_name)]
         for admin in data.admins:
             bot.send_message(chat_id=admin.chat_id, text='The submission of {0} on problem \'{1}\' has been deleted.'.format(contestant_name, problem_name))
         for contestant in data.contestants:
-            if contestant.name != contestant_name:
-                continue
-            bot.send_message(chat_id=contestant.chat_id, text='Your submission on problem \'{0}\' has been deleted by an admin. You can submit again.'.format(problem_name))
+            if contestant.user_id == contestant_id:
+                bot.send_message(chat_id=contestant.chat_id, text='Your submission on problem \'{0}\' has been deleted by an admin. You can submit again.'.format(problem_name))
     except CodeContestError as error:
         bot.send_message(chat_id=chat_id, text=error.msg)
 
 
 def ranking(bot, update):
-    chat_id = update.message.chat_id
+    try:
+        name, chat_id, user_id = extract_user_info(update)
 
-    row_format = "{:<20}" + "{:<10}" * (len(data.problems) + 1)
+        row_format = "{:<20}" + "{:<10}" * (len(data.problems) + 1)
 
-    header = row_format.format('Contestant', *[problem.name for problem in data.problems], 'Total')
-    rows = []
-    for contestant in data.contestants:
-        total = 0
-        individual_scores = []
-        for problem in data.problems:
-            if (contestant.name, problem.name) in data.scores:
-                score = data.scores[(contestant.name, problem.name)]
-                individual_scores.append(score)
-                total += score
-            else:
-                individual_scores.append('-')
-        rows.append(row_format.format(contestant.name, *individual_scores, total))
-    msg = header + '\n' + '\n'.join(rows)
-    bot.send_message(chat_id=chat_id, text='```txt\n' + msg + ' ```',
-                     parse_mode=telegram.ParseMode.MARKDOWN)
+        header = row_format.format('Contestant', *[problem.name for problem in data.problems], 'Total')
+        rows = []
+        for contestant in data.contestants:
+            total = 0
+            individual_scores = []
+            for problem in data.problems:
+                if (contestant.user_id, problem.name) in data.scores:
+                    score = data.scores[(contestant.user_id, problem.name)]
+                    individual_scores.append(score)
+                    total += score
+                else:
+                    individual_scores.append('-')
+            rows.append(row_format.format(contestant.name, *individual_scores, total))
+        msg = header + '\n' + '\n'.join(rows)
+        bot.send_message(chat_id=chat_id, text='```txt\n' + msg + ' ```',
+                         parse_mode=telegram.ParseMode.MARKDOWN)
+    except CodeContestError as error:
+        bot.send_message(chat_id=chat_id, text=error.msg)
 
 
 def help(bot, update):
